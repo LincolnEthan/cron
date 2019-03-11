@@ -3,7 +3,7 @@ package cron
 import (
 	"log"
 	"runtime"
-	"sort"
+	"sync"
 	"time"
 )
 
@@ -11,13 +11,17 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries  []*Entry
+	entries  Entries
 	stop     chan struct{}
 	add      chan *Entry
+	reset    chan *Entry
+	remove   chan string
 	snapshot chan []*Entry
 	running  bool
 	ErrorLog *log.Logger
 	location *time.Location
+
+	mtx *sync.Mutex
 }
 
 // Job is an interface for submitted cron jobs.
@@ -32,42 +36,6 @@ type Schedule interface {
 	Next(time.Time) time.Time
 }
 
-// Entry consists of a schedule and the func to execute on that schedule.
-type Entry struct {
-	// The schedule on which this job should be run.
-	Schedule Schedule
-
-	// The next time the job will run. This is the zero time if Cron has not been
-	// started or this entry's schedule is unsatisfiable
-	Next time.Time
-
-	// The last time this job was run. This is the zero time if the job has never
-	// been run.
-	Prev time.Time
-
-	// The Job to run.
-	Job Job
-}
-
-// byTime is a wrapper for sorting the entry array by time
-// (with zero time at the end).
-type byTime []*Entry
-
-func (s byTime) Len() int      { return len(s) }
-func (s byTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s byTime) Less(i, j int) bool {
-	// Two zero times should return false.
-	// Otherwise, zero is "greater" than any other time.
-	// (To sort it at the end of the list.)
-	if s[i].Next.IsZero() {
-		return false
-	}
-	if s[j].Next.IsZero() {
-		return true
-	}
-	return s[i].Next.Before(s[j].Next)
-}
-
 // New returns a new Cron job runner, in the Local time zone.
 func New() *Cron {
 	return NewWithLocation(time.Now().Location())
@@ -76,13 +44,16 @@ func New() *Cron {
 // NewWithLocation returns a new Cron job runner.
 func NewWithLocation(location *time.Location) *Cron {
 	return &Cron{
-		entries:  nil,
+		entries:  make(Entries),
 		add:      make(chan *Entry),
+		reset:    make(chan *Entry),
+		remove:   make(chan string),
 		stop:     make(chan struct{}),
 		snapshot: make(chan []*Entry),
 		running:  false,
 		ErrorLog: nil,
 		location: location,
+		mtx:      &sync.Mutex{},
 	}
 }
 
@@ -92,36 +63,73 @@ type FuncJob func()
 func (f FuncJob) Run() { f() }
 
 // AddFunc adds a func to the Cron to be run on the given schedule.
-func (c *Cron) AddFunc(spec string, cmd func()) error {
+func (c *Cron) AddFunc(spec string, cmd func()) (string, error) {
 	return c.AddJob(spec, FuncJob(cmd))
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
-func (c *Cron) AddJob(spec string, cmd Job) error {
+func (c *Cron) AddJob(spec string, cmd Job) (string, error) {
+	schedule, err := Parse(spec)
+	if err != nil {
+		return "", err
+	}
+	id := c.Schedule(schedule, cmd)
+	return id, nil
+}
+
+func (c *Cron) Remove(id string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if !c.running {
+		c.entries.Remove(id)
+		return
+	}
+
+	c.remove <- id
+}
+
+func (c *Cron) ResetJob(spec string, id string) error {
 	schedule, err := Parse(spec)
 	if err != nil {
 		return err
 	}
-	c.Schedule(schedule, cmd)
+	c.Reschedule(schedule, id)
 	return nil
 }
 
-// Schedule adds a Job to the Cron to be run on the given schedule.
-func (c *Cron) Schedule(schedule Schedule, cmd Job) {
-	entry := &Entry{
-		Schedule: schedule,
-		Job:      cmd,
-	}
+//Reschedule 重新安排时间
+func (c *Cron) Reschedule(schedule Schedule, id string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	if !c.running {
-		c.entries = append(c.entries, entry)
-		return
+		if ent, ok := c.entries.Get(id); ok {
+			ent.Schedule = schedule
+		}
+	}
+	c.reset <- &Entry{
+		Schedule: schedule,
+		id:       id,
+	}
+}
+
+// Schedule adds a Job to the Cron to be run on the given schedule.
+func (c *Cron) Schedule(schedule Schedule, cmd Job) string {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	entry := newEntry(schedule, cmd)
+	if !c.running {
+		c.entries.Add(entry)
+		return entry.id
 	}
 
 	c.add <- entry
+	return entry.id
 }
 
 // Entries returns a snapshot of the cron entries.
 func (c *Cron) Entries() []*Entry {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	if c.running {
 		c.snapshot <- nil
 		x := <-c.snapshot
@@ -137,6 +145,8 @@ func (c *Cron) Location() *time.Location {
 
 // Start the cron scheduler in its own go-routine, or no-op if already started.
 func (c *Cron) Start() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	if c.running {
 		return
 	}
@@ -146,10 +156,13 @@ func (c *Cron) Start() {
 
 // Run the cron scheduler, or no-op if already running.
 func (c *Cron) Run() {
+	c.mtx.Lock()
 	if c.running {
+		c.mtx.Unlock()
 		return
 	}
 	c.running = true
+	c.mtx.Unlock()
 	c.run()
 }
 
@@ -176,15 +189,15 @@ func (c *Cron) run() {
 
 	for {
 		// Determine the next entry to run.
-		sort.Sort(byTime(c.entries))
+		entries := c.entries.Sort()
 
 		var timer *time.Timer
-		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
+		if len(entries) == 0 || entries[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
 			// and stop requests.
 			timer = time.NewTimer(100000 * time.Hour)
 		} else {
-			timer = time.NewTimer(c.entries[0].Next.Sub(now))
+			timer = time.NewTimer(entries[0].Next.Sub(now))
 		}
 
 		for {
@@ -192,7 +205,7 @@ func (c *Cron) run() {
 			case now = <-timer.C:
 				now = now.In(c.location)
 				// Run every entry whose next time was less than now
-				for _, e := range c.entries {
+				for _, e := range entries {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
@@ -200,12 +213,21 @@ func (c *Cron) run() {
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
 				}
+			case entryID := <-c.remove:
+				c.entries.Remove(entryID)
 
+			case entry := <-c.reset:
+				if ent, ok := c.entries.Get(entry.id); ok {
+					timer.Stop()
+					now = c.now()
+					ent.Schedule = entry.Schedule // 重置schedule
+					ent.Next = ent.Schedule.Next(now)
+				}
 			case newEntry := <-c.add:
 				timer.Stop()
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
-				c.entries = append(c.entries, newEntry)
+				c.entries.Add(newEntry)
 
 			case <-c.snapshot:
 				c.snapshot <- c.entrySnapshot()
@@ -232,6 +254,8 @@ func (c *Cron) logf(format string, args ...interface{}) {
 
 // Stop stops the cron scheduler if it is running; otherwise it does nothing.
 func (c *Cron) Stop() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	if !c.running {
 		return
 	}
@@ -239,10 +263,22 @@ func (c *Cron) Stop() {
 	c.running = false
 }
 
+//GracefulStop 优雅的stop
+func (c *Cron) GracefulStop() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if !c.running {
+		return
+	}
+
+	c.stop <- struct{}{}
+	c.running = false
+}
+
 // entrySnapshot returns a copy of the current cron entry list.
 func (c *Cron) entrySnapshot() []*Entry {
 	entries := []*Entry{}
-	for _, e := range c.entries {
+	for _, e := range c.entries.Sort() {
 		entries = append(entries, &Entry{
 			Schedule: e.Schedule,
 			Next:     e.Next,
